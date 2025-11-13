@@ -8,6 +8,8 @@ from ...llm.client import ChatMessage, LLMClient, get_default_client
 from ...llm.embeddings import BaseEmbedding, get_default_embedding
 from ..base import AgentAnswer
 from .base import Metric
+from ragas.dataset_schema import SingleTurnSample
+from langchain_core.outputs import ChatGeneration
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,31 @@ class RagasLLMWrapper(BaseRagasLLM):
         callbacks=[],
     ):
         return self.generate_text(prompt, n, temperature, stop, callbacks)
+    
+    def is_finished(self, response: LLMResult) -> bool:
+        """
+        Return True if all generations ended normally.
+        Checks OpenAI/Vertex-style finish reasons ('stop', 'end_turn', 'MAX_TOKENS')
+        and falls back to True when metadata is missing.
+        """
+        flags: list[bool] = []
+        for gens in response.generations:
+            if not gens:
+                flags.append(True)
+                continue
+            resp = gens[0]
+            fin = None
+
+            if getattr(resp, "generation_info", None):
+                fin = resp.generation_info.get("finish_reason")
+
+            if fin is None and isinstance(resp, ChatGeneration):
+                meta = resp.message.response_metadata or {}
+                fin = meta.get("finish_reason") or meta.get("stop_reason")
+
+            flags.append(fin in ["stop", "STOP", "end_turn", "MAX_TOKENS", None])
+
+        return all(flags)
 
 
 class RagasEmbeddingsWrapper(BaseRagasEmbeddings):
@@ -120,7 +147,21 @@ class RagasMetric(Metric):
 
         ragas_sample = self.prepare_ragas_sample(question_sample, answer)
 
-        return {self.name: self.metric.score(ragas_sample)}
+        #return {self.name: self.metric.score(ragas_sample)}
+        
+        sample = SingleTurnSample(
+            user_input=ragas_sample.get("user_input") or ragas_sample.get("question"),
+            response=ragas_sample.get("response") or ragas_sample.get("answer"),
+            retrieved_contexts=ragas_sample.get("retrieved_contexts") or ragas_sample.get("contexts"),
+            reference=ragas_sample.get("reference") or ragas_sample.get("ground_truth"),
+        )
+
+        if hasattr(self.metric, "single_turn_score"):
+            val = self.metric.single_turn_score(sample)
+        else:
+            val = self.metric.score(ragas_sample)
+
+        return {self.name: val}
 
     @staticmethod
     def prepare_ragas_sample(question_sample: dict, answer: AgentAnswer) -> dict:
